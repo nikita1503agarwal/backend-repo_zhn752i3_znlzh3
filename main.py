@@ -3,12 +3,23 @@ import random
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
 
 from database import db, create_document, get_documents
 from schemas import Entry as EntrySchema, Draw as DrawSchema
+
+# Optional Stripe integration
+STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY") or os.getenv("STRIPE_API_KEY")
+FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000")
+
+try:
+    import stripe  # type: ignore
+    if STRIPE_SECRET_KEY:
+        stripe.api_key = STRIPE_SECRET_KEY
+except Exception:
+    stripe = None
 
 app = FastAPI(title="Hourly Raffle API")
 
@@ -65,9 +76,7 @@ def api_status():
             status="open",
             entries_count=0,
         )
-        _id = create_document("draw", new_draw)
-        existing = db["draw"].find_one({"_id": db["draw"].find_one({"_id": db["draw"].find_one})})
-        # the above line is not meaningful; fetch again correctly:
+        _ = create_document("draw", new_draw)
         existing = db["draw"].find_one({"draw_id": draw_id})
 
     entries_count = 0
@@ -90,11 +99,21 @@ def api_status():
             "entries_count": entries_count,
         },
         "last_winner": last_winner,
+        "payments": {
+            "enabled": bool(STRIPE_SECRET_KEY and stripe),
+            "amount": 1000,  # cents
+            "currency": "usd",
+            "price": 10.00,
+        },
     }
 
 
 @app.post("/api/enter")
 def enter_draw(payload: CreateEntryRequest):
+    """Legacy free entry endpoint. If payments are enabled, block direct entry."""
+    if STRIPE_SECRET_KEY and stripe:
+        raise HTTPException(status_code=403, detail="El portal de pagos está activo. Usa el flujo de pago para participar.")
+
     draw_id = current_draw_id()
 
     # prevent duplicate email in the same hour
@@ -162,6 +181,73 @@ def close_current_draw():
     }}
 
 
+# Payments: Stripe Checkout session creator
+@app.post("/api/pay/checkout-session")
+def create_checkout_session(payload: CreateEntryRequest):
+    if not (stripe and STRIPE_SECRET_KEY):
+        raise HTTPException(status_code=503, detail="Pagos no disponibles")
+
+    draw_id = current_draw_id()
+
+    # prevent duplicate before charging
+    if db and db["entry"].find_one({"draw_id": draw_id, "email": payload.email}):
+        raise HTTPException(status_code=400, detail="Ya estás participando en el sorteo de esta hora.")
+
+    try:
+        session = stripe.checkout.Session.create(
+            mode="payment",
+            payment_method_types=["card"],
+            line_items=[{
+                "quantity": 1,
+                "price_data": {
+                    "currency": "usd",
+                    "product_data": {"name": f"Entrada sorteo {draw_id}"},
+                    "unit_amount": 1000,  # $10.00 in cents
+                },
+            }],
+            metadata={
+                "draw_id": draw_id,
+                "name": payload.name,
+                "email": payload.email,
+            },
+            success_url=f"{FRONTEND_URL}?success=true&session_id={{CHECKOUT_SESSION_ID}}",
+            cancel_url=f"{FRONTEND_URL}?canceled=true",
+        )
+        return {"id": session.id, "url": session.url}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/pay/confirm")
+def confirm_checkout(session_id: str = Query(..., description="Stripe Checkout Session ID")):
+    if not (stripe and STRIPE_SECRET_KEY):
+        raise HTTPException(status_code=503, detail="Pagos no disponibles")
+
+    try:
+        session = stripe.checkout.Session.retrieve(session_id)
+        if session.get("payment_status") != "paid":
+            raise HTTPException(status_code=402, detail="Pago no completado")
+
+        meta = session.get("metadata") or {}
+        draw_id = meta.get("draw_id") or current_draw_id()
+        name = meta.get("name")
+        email = meta.get("email")
+        if not (name and email):
+            raise HTTPException(status_code=400, detail="Datos de participante incompletos")
+
+        # idempotency: if entry exists, return ok
+        if db and db["entry"].find_one({"draw_id": draw_id, "email": email}):
+            return {"ok": True, "message": "Pago confirmado. Ya estabas registrado en este sorteo."}
+
+        entry = EntrySchema(name=name, email=email, draw_id=draw_id)
+        _id = create_document("entry", entry)
+        return {"ok": True, "message": "Pago confirmado y participación registrada.", "entry_id": _id, "draw_id": draw_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/test")
 def test_database():
     response = {
@@ -170,7 +256,8 @@ def test_database():
         "database_url": None,
         "database_name": None,
         "connection_status": "Not Connected",
-        "collections": []
+        "collections": [],
+        "payments": "Disabled"
     }
 
     try:
@@ -194,6 +281,9 @@ def test_database():
 
     response["database_url"] = "✅ Set" if os.getenv("DATABASE_URL") else "❌ Not Set"
     response["database_name"] = "✅ Set" if os.getenv("DATABASE_NAME") else "❌ Not Set"
+
+    # payments status
+    response["payments"] = "✅ Enabled" if (stripe and STRIPE_SECRET_KEY) else "Disabled"
 
     return response
 
